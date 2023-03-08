@@ -2,7 +2,7 @@ import Redis from 'ioredis';
 import * as cheerio from 'cheerio';
 import { Options } from 'selenium-webdriver/chrome';
 import { Builder, Browser, By, WebDriver } from 'selenium-webdriver';
-import { Controller, Get, Res } from '@nestjs/common';
+import { Body, Controller, Get, Post, Res } from '@nestjs/common';
 import { AppService } from './app.service';
 import { Response } from 'express';
 
@@ -16,9 +16,15 @@ export class AppController {
     });
   }
 
+  @Post('/log')
+  async log(@Body() body: string): Promise<void> {
+    console.log(body);
+  }
+
   @Get()
-  getHello(): string {
-    return this.appService.getHello();
+  async getHello(): Promise<any[]> {
+    const records = await this.redis.hgetall('yuka.communes');
+    return Object.keys(records).map((key) => JSON.parse(records[key]));
   }
 
   @Get('scrap')
@@ -34,19 +40,17 @@ export class AppController {
       .setChromeOptions(options)
       .build();
     await driver.get(
-      'https://orobnat.sante.gouv.fr/orobnat/afficherPage.do?methode=menu&usd=AEP&idRegion=44',
+      'https://orobnat.sante.gouv.fr/orobnat/afficherPage.do?methode=menu&usd=AEP&idRegion=24',
     );
 
     const departements = await this.listDepartements(driver);
+    await driver.quit();
 
     await Promise.all(
       departements.map((departement: string) =>
         this.scrapeDepartement(departement),
       ),
     );
-
-    // await driver.findElement(By.name('btnRechercher')).click();
-    await driver.quit();
   }
 
   async scrapeDepartement(departement: string): Promise<void> {
@@ -59,7 +63,7 @@ export class AppController {
       .setChromeOptions(options)
       .build();
     await driver.get(
-      'https://orobnat.sante.gouv.fr/orobnat/afficherPage.do?methode=menu&usd=AEP&idRegion=44',
+      'https://orobnat.sante.gouv.fr/orobnat/afficherPage.do?methode=menu&usd=AEP&idRegion=24',
     );
 
     await driver.findElement(By.name('departement')).click();
@@ -69,6 +73,7 @@ export class AppController {
       if (
         (await this.redis.hexists('yuka.communes-raw-table', commune)) === 1
       ) {
+        console.log(`Skipping ${commune}`);
         continue;
       }
 
@@ -91,6 +96,8 @@ export class AppController {
         console.log('damn, an error', { commune, e });
       }
     }
+
+    await driver.quit();
   }
 
   async listCommunes(driver: WebDriver): Promise<string[]> {
@@ -115,5 +122,62 @@ export class AppController {
       options.push($(this).attr('value'));
     });
     return options;
+  }
+
+  @Get('compute')
+  async compute() {
+    const rawCommunes = await this.redis.hgetall('yuka.communes-raw-table');
+    const communes = Object.keys(rawCommunes).forEach(
+      async (key: string, i: number) => {
+        if (await this.redis.hexists('yuka.communes', key)) {
+          console.log(`skipp ${key}`);
+          return;
+        }
+        console.log(i, key);
+        const generalInformationsTable = cheerio.load(
+          `<html><head></head><body><table>${
+            JSON.parse(
+              rawCommunes[key].replaceAll('\\\\t', '').replaceAll('\\\\n', ''),
+            ).generalInformations
+          }</table></body></html>`,
+        );
+        const dateDePrelevement =
+          generalInformationsTable('tr:nth-child(1) td').text();
+        const resultsTable = cheerio.load(
+          `<html><head></head><body><table>${
+            JSON.parse(
+              rawCommunes[key].replaceAll('\\\\t', '').replaceAll('\\\\n', ''),
+            ).results
+          }</table></body></html>`,
+        );
+
+        const results = [];
+        const resultsLength = resultsTable('tbody tr').length;
+        for (let i = 0; i < resultsLength; i++) {
+          results.push({
+            key: resultsTable(
+              `tbody tr:nth-child(${i + 1}) td:nth-child(1)`,
+            ).text(),
+            value: resultsTable(
+              `tbody tr:nth-child(${i + 1}) td:nth-child(2)`,
+            ).text(),
+            maximum: resultsTable(
+              `tbody tr:nth-child(${i + 1}) td:nth-child(3)`,
+            ).text(),
+          });
+        }
+        await this.redis.hset(
+          'yuka.communes',
+          key,
+          JSON.stringify({
+            commune: key,
+            dateDePrelevement,
+            results,
+          }),
+        );
+      },
+    );
+
+    console.log(communes);
   }
 }
